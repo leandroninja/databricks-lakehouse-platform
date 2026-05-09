@@ -1,0 +1,166 @@
+{
+  "name": "lakehouse-etl-pipeline-prod",
+  "description": "Full Lakehouse ETL: Bronze -> Silver -> Gold -> ML Training",
+  "max_concurrent_runs": 1,
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "America/Sao_Paulo",
+    "pause_status": "UNPAUSED"
+  },
+  "job_clusters": [
+    {
+      "job_cluster_key": "ingestion_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "Standard_D8s_v3",
+        "driver_node_type_id": "Standard_D8s_v3",
+        "autoscale": {
+          "min_workers": 2,
+          "max_workers": 10
+        },
+        "enable_elastic_disk": true,
+        "azure_attributes": {
+          "first_on_demand": 1,
+          "availability": "SPOT_WITH_FALLBACK_AZURE",
+          "spot_bid_max_price": -1
+        },
+        "spark_conf": {
+          "spark.databricks.delta.preview.enabled": "true",
+          "spark.databricks.delta.autoCompact.enabled": "true",
+          "spark.databricks.delta.optimizeWrite.enabled": "true",
+          "spark.sql.adaptive.enabled": "true",
+          "spark.sql.adaptive.coalescePartitions.enabled": "true"
+        },
+        "spark_env_vars": {
+          "CATALOG": "prod_catalog",
+          "ENVIRONMENT": "prod"
+        },
+        "custom_tags": {
+          "Project": "lakehouse-platform",
+          "Layer": "ingestion",
+          "CostCenter": "data-platform"
+        },
+        "init_scripts": [
+          {
+            "workspace": {
+              "destination": "/Shared/init-scripts/install-deps.sh"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "job_cluster_key": "ml_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-gpu-ml-scala2.12",
+        "node_type_id": "Standard_NC6s_v3",
+        "num_workers": 4,
+        "azure_attributes": {
+          "availability": "ON_DEMAND_AZURE"
+        },
+        "custom_tags": {
+          "Project": "lakehouse-platform",
+          "Layer": "ml",
+          "CostCenter": "data-science"
+        }
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "ingest_bronze",
+      "description": "Auto Loader ingestion to Bronze layer",
+      "job_cluster_key": "ingestion_cluster",
+      "python_wheel_task": {
+        "package_name": "lakehouse_platform",
+        "entry_point": "run_bronze_ingestion",
+        "parameters": ["--catalog", "prod_catalog", "--env", "prod"]
+      },
+      "libraries": [
+        {"whl": "dbfs:/Shared/libs/lakehouse_platform-latest-py3-none-any.whl"}
+      ],
+      "timeout_seconds": 3600,
+      "max_retries": 2,
+      "min_retry_interval_millis": 300000,
+      "retry_on_timeout": false
+    },
+    {
+      "task_key": "transform_silver",
+      "description": "Cleanse and transform to Silver layer with SCD2",
+      "depends_on": [{"task_key": "ingest_bronze"}],
+      "job_cluster_key": "ingestion_cluster",
+      "python_wheel_task": {
+        "package_name": "lakehouse_platform",
+        "entry_point": "run_silver_transformation"
+      },
+      "timeout_seconds": 7200,
+      "max_retries": 1
+    },
+    {
+      "task_key": "build_gold",
+      "description": "Build Gold business aggregations and feature tables",
+      "depends_on": [{"task_key": "transform_silver"}],
+      "job_cluster_key": "ingestion_cluster",
+      "python_wheel_task": {
+        "package_name": "lakehouse_platform",
+        "entry_point": "run_gold_aggregations"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "data_quality_gate",
+      "description": "Validate data quality SLAs before ML training",
+      "depends_on": [{"task_key": "build_gold"}],
+      "job_cluster_key": "ingestion_cluster",
+      "python_wheel_task": {
+        "package_name": "lakehouse_platform",
+        "entry_point": "run_quality_checks"
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 0
+    },
+    {
+      "task_key": "train_model",
+      "description": "MLflow model training with hyperparameter tuning",
+      "depends_on": [{"task_key": "data_quality_gate"}],
+      "job_cluster_key": "ml_cluster",
+      "python_wheel_task": {
+        "package_name": "lakehouse_platform",
+        "entry_point": "run_training_pipeline"
+      },
+      "timeout_seconds": 14400,
+      "max_retries": 1
+    },
+    {
+      "task_key": "maintenance",
+      "description": "Delta Lake OPTIMIZE + VACUUM",
+      "depends_on": [{"task_key": "build_gold"}],
+      "job_cluster_key": "ingestion_cluster",
+      "python_wheel_task": {
+        "package_name": "lakehouse_platform",
+        "entry_point": "run_maintenance"
+      },
+      "timeout_seconds": 7200,
+      "max_retries": 0
+    }
+  ],
+  "email_notifications": {
+    "on_failure": ["leandro.moraes.devops@gmail.com"],
+    "on_success": [],
+    "no_alert_for_skipped_runs": true
+  },
+  "webhook_notifications": {
+    "on_failure": [
+      {
+        "id": "slack-webhook-data-alerts"
+      }
+    ]
+  },
+  "tags": {
+    "Project": "lakehouse-platform",
+    "Environment": "prod",
+    "ManagedBy": "azure-devops",
+    "Owner": "data-platform-team"
+  }
+}
